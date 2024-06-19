@@ -7,16 +7,18 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use git2::Oid;
+use git2_ext::ops::{Sign, UserSign};
+
 use crate::{
     config::Config,
     error::{Error, Result, ResultExt},
     github::GitHubBranch,
     message::{
-        build_commit_message, parse_message, MessageSection, MessageSectionsMap,
+        build_commit_message, MessageSection, MessageSectionsMap, parse_message,
     },
     utils::run_command,
 };
-use git2::Oid;
 
 #[derive(Debug)]
 pub struct PreparedCommit {
@@ -69,6 +71,25 @@ impl Git {
             .collect()
     }
 
+    pub fn commit(
+        repo: &git2::Repository,
+        author: &git2::Signature<'_>,
+        committer: &git2::Signature<'_>,
+        message: &str,
+        tree: &git2::Tree<'_>,
+        parents: &[&git2::Commit<'_>],
+        sign: Option<impl Sign>,
+    ) -> std::result::Result<Oid, git2::Error> {
+        if let Some(sign) = sign {
+            let content = repo.commit_create_buffer(author, committer, message, tree, parents)?;
+            let content = std::str::from_utf8(&content).unwrap();
+            let signed = sign.sign(content)?;
+            repo.commit_signed(content, &signed, None)
+        } else {
+            repo.commit(None, author, committer, message, tree, parents)
+        }
+    }
+
     pub fn rewrite_commit_messages(
         &self,
         commits: &mut [PreparedCommit],
@@ -102,13 +123,15 @@ impl Git {
             limit = limit.map(|n| if n > 0 { n - 1 } else { 0 });
 
             if updating {
-                let new_oid = repo.commit(
-                    None,
+
+                let new_oid = Self::commit(
+                    &repo,
                     &commit.author(),
                     &commit.committer(),
                     &message[..],
                     &commit.tree()?,
                     &[&repo.find_commit(parent_oid.unwrap_or(first_parent))?],
+                    UserSign::from_config(&repo, &repo.config()?).ok()
                 )?;
                 hooks.run_post_rewrite_rebase(
                     &repo,
@@ -170,13 +193,14 @@ impl Git {
             }
             let tree = repo.find_tree(tree_oid)?;
 
-            new_parent_oid = repo.commit(
-                None,
+            new_parent_oid = Self::commit(
+                &repo,
                 &commit.author(),
                 &commit.committer(),
                 String::from_utf8_lossy(commit.message_bytes()).as_ref(),
                 &tree,
                 &[&new_parent_commit],
+                UserSign::from_config(&repo, &repo.config()?).ok()
             )?;
             hooks.run_post_rewrite_rebase(
                 &repo,
@@ -476,13 +500,14 @@ impl Git {
                 .as_ref(),
         )?;
 
-        let oid = repo.commit(
-            None,
+        let oid = Self::commit(
+            &repo,
             &author,
             &committer,
             &message,
             &tree,
             &parent_refs[..],
+            UserSign::from_config(&repo, &repo.config()?).ok(),
         )?;
 
         Ok(oid)
